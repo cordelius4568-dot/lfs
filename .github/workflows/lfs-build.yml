@@ -7,8 +7,8 @@
 #   paket yön.: xbps (Void Linux'un paket yöneticisi)
 #   Çekirdek : Linux 6.13.4 (defconfig + kvm_guest, modülsüz)
 #
-# Aşamalar: sources -> toolchain -> temp-tools -> final (chroot) -> image (+kernel)
-# Her aşama ayrı job (6 saat limiti için), aralarında artifact taşınır.
+# Aşamalar (tek job, artifact kotası sorunu olmasın diye): kaynaklar -> kernel -> toolchain ->
+# temp-tools -> chroot (nihai sistem) -> imaj -> QEMU testi -> release. Tahmini süre 1.5-3 saat.
 
 name: Build Linux From Scratch
 
@@ -45,11 +45,24 @@ env:
   SRC: /mnt/src
 
 jobs:
-  # ---------------------------------------------------------------- 1) kaynaklar
-  sources:
+  build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 350
+    permissions:
+      contents: write
+    env:
+      IMAGE_SIZE: ${{ inputs.image_size }}
     steps:
+      - name: Hazırlık (tüm bağımlılıklar)
+        run: |
+          sudo chown "$USER" /mnt
+          sudo mkdir -p /mnt/src /mnt/lfs /mnt/build /mnt/img
+          sudo chown "$USER" /mnt/src /mnt/lfs /mnt/build
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential bison flex gawk texinfo m4 zstd xz-utils patch \
+            bc libelf-dev libssl-dev ca-certificates grub-pc-bin grub2-common parted e2fsprogs
+          sudo ln -sf bash /bin/sh
+          df -h / /mnt
       - name: Kaynak kodları indir
         run: |
           sudo mkdir -p /mnt/src
@@ -123,31 +136,21 @@ jobs:
           EOF
           ls -lh
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sources
-          path: /mnt/src
-          retention-days: 1
-          compression-level: 0
-
-  # ---------------------------------------------------------------- 2) çapraz toolchain
-  toolchain:
-    needs: sources
-    runs-on: ubuntu-24.04
-    timeout-minutes: 350
-    steps:
-      - name: Hazırlık
+      - name: Çekirdeği derle
         run: |
-          sudo mkdir -p /mnt/src /mnt/lfs /mnt/build
-          sudo chown "$USER" /mnt/src /mnt/lfs /mnt/build
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential bison flex gawk texinfo m4 zstd xz-utils patch
-          sudo ln -sf bash /bin/sh
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: sources
-          path: /mnt/src
+          . /mnt/src/helpers.sh
+          unpack linux-6.13.4
+          make defconfig kvm_guest.config
+          ./scripts/config \
+            -e DEVTMPFS -e DEVTMPFS_MOUNT -e EXT4_FS -e TMPFS -e DEVPTS_FS \
+            -e SERIAL_8250 -e SERIAL_8250_CONSOLE \
+            -e VIRTIO_BLK -e VIRTIO_PCI -e VIRTIO_NET -e SCSI_VIRTIO \
+            -e ATA -e SATA_AHCI -e ATA_PIIX -e BLK_DEV_NVME \
+            -e E1000 -e E1000E -e R8169 \
+            -e USB_XHCI_HCD -e USB_XHCI_PCI -e USB_STORAGE
+          make olddefconfig
+          make bzImage
+          cp arch/x86/boot/bzImage /mnt/vmlinuz-6.13.4
 
       - name: binutils, gcc, linux headers, glibc, libstdc++ (LFS bölüm 5)
         run: |
@@ -221,47 +224,6 @@ jobs:
             make DESTDIR=$LFS install
             rm -v $LFS/usr/lib/lib{stdc++{,exp,fs},supc++}.la
           )
-
-      - name: Paketle
-        run: |
-          sudo tar --numeric-owner -I 'zstd -T0 -3' -cpf /mnt/toolchain.tar.zst -C "$LFS" .
-          ls -lh /mnt/toolchain.tar.zst
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: toolchain
-          path: /mnt/toolchain.tar.zst
-          retention-days: 1
-          compression-level: 0
-
-  # ---------------------------------------------------------------- 3) geçici araçlar
-  temp-tools:
-    needs: toolchain
-    runs-on: ubuntu-24.04
-    timeout-minutes: 350
-    steps:
-      - name: Hazırlık
-        run: |
-          sudo mkdir -p /mnt/src /mnt/lfs /mnt/build /mnt/dl
-          sudo chown "$USER" /mnt/src /mnt/lfs /mnt/build /mnt/dl
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential bison flex gawk texinfo m4 zstd xz-utils patch
-          sudo ln -sf bash /bin/sh
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: sources
-          path: /mnt/src
-      - uses: actions/download-artifact@v4
-        with:
-          name: toolchain
-          path: /mnt/dl
-
-      - name: Toolchain'i aç
-        run: |
-          sudo tar --numeric-owner -I zstd -xpf /mnt/dl/toolchain.tar.zst -C "$LFS"
-          sudo chown -R "$USER" "$LFS"
-          rm -f /mnt/dl/toolchain.tar.zst
 
       - name: Geçici araçlar (LFS bölüm 6)
         run: |
@@ -394,44 +356,8 @@ jobs:
             make DESTDIR=$LFS install
             ln -sv gcc $LFS/usr/bin/cc )
 
-      - name: Paketle
+      - name: Chroot hazırla
         run: |
-          sudo tar --numeric-owner -I 'zstd -T0 -3' -cpf /mnt/temptools.tar.zst -C "$LFS" .
-          ls -lh /mnt/temptools.tar.zst
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: temptools
-          path: /mnt/temptools.tar.zst
-          retention-days: 1
-          compression-level: 0
-
-  # ---------------------------------------------------------------- 4) chroot: nihai sistem
-  final:
-    needs: temp-tools
-    runs-on: ubuntu-24.04
-    timeout-minutes: 350
-    steps:
-      - name: Hazırlık
-        run: |
-          sudo mkdir -p /mnt/src /mnt/lfs /mnt/dl
-          sudo chown "$USER" /mnt/src /mnt/lfs /mnt/dl
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq zstd xz-utils ca-certificates
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: sources
-          path: /mnt/src
-      - uses: actions/download-artifact@v4
-        with:
-          name: temptools
-          path: /mnt/dl
-
-      - name: Aç ve chroot hazırla
-        run: |
-          sudo tar --numeric-owner -I zstd -xpf /mnt/dl/temptools.tar.zst -C "$LFS"
-          rm -f /mnt/dl/temptools.tar.zst
           sudo cp -r /mnt/src "$LFS/sources"
           sudo chown -R root:root $LFS/{usr,lib,var,etc,bin,sbin,tools,lib64,sources}
           sudo mkdir -pv $LFS/{dev,proc,sys,run}
@@ -735,85 +661,13 @@ jobs:
 
       - name: Rootfs paketle
         run: |
-          sudo tar --numeric-owner -I 'zstd -T0 -10' -cpf /mnt/rootfs.tar.zst -C "$LFS" .
-          ls -lh /mnt/rootfs.tar.zst
+          sudo tar --numeric-owner -I 'zstd -T0 -10' -cpf /mnt/lfs-openrc-rootfs.tar.zst -C "$LFS" .
+          ls -lh /mnt/lfs-openrc-rootfs.tar.zst
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rootfs
-          path: /mnt/rootfs.tar.zst
-          retention-days: 3
-          compression-level: 0
-
-  # ---------------------------------------------------------------- 4b) çekirdek (paralel)
-  kernel:
-    needs: sources
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    steps:
-      - name: Hazırlık
+      - name: Yer aç
         run: |
-          sudo chown "$USER" /mnt
-          sudo mkdir -p /mnt/src /mnt/build
-          sudo chown "$USER" /mnt/src /mnt/build
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential bc flex bison libelf-dev libssl-dev xz-utils
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: sources
-          path: /mnt/src
-
-      - name: Çekirdeği derle
-        run: |
-          . /mnt/src/helpers.sh
-          unpack linux-6.13.4
-          make defconfig kvm_guest.config
-          ./scripts/config \
-            -e DEVTMPFS -e DEVTMPFS_MOUNT -e EXT4_FS -e TMPFS -e DEVPTS_FS \
-            -e SERIAL_8250 -e SERIAL_8250_CONSOLE \
-            -e VIRTIO_BLK -e VIRTIO_PCI -e VIRTIO_NET -e SCSI_VIRTIO \
-            -e ATA -e SATA_AHCI -e ATA_PIIX -e BLK_DEV_NVME \
-            -e E1000 -e E1000E -e R8169 \
-            -e USB_XHCI_HCD -e USB_XHCI_PCI -e USB_STORAGE
-          make olddefconfig
-          make bzImage
-          cp arch/x86/boot/bzImage /mnt/vmlinuz-6.13.4
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: kernel
-          path: /mnt/vmlinuz-6.13.4
-          retention-days: 3
-          compression-level: 0
-
-  # ---------------------------------------------------------------- 5) disk imajı + test + release
-  image:
-    needs: [final, kernel]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    permissions:
-      contents: write
-    env:
-      IMAGE_SIZE: ${{ inputs.image_size }}
-    steps:
-      - name: Hazırlık
-        run: |
-          sudo chown "$USER" /mnt
-          sudo mkdir -p /mnt/dl /mnt/img
-          sudo chown "$USER" /mnt/dl
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq grub-pc-bin grub2-common parted e2fsprogs zstd
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: rootfs
-          path: /mnt/dl
-      - uses: actions/download-artifact@v4
-        with:
-          name: kernel
-          path: /mnt/dl
-
+          sudo rm -rf /mnt/lfs /mnt/build /mnt/src
+          df -h /mnt
       - name: Bootable BIOS imajı oluştur
         run: |
           cd /mnt
@@ -825,8 +679,8 @@ jobs:
           sleep 1
           sudo mkfs.ext4 -q -F -L rootfs "${LOOP}p1"
           sudo mount "${LOOP}p1" /mnt/img
-          sudo tar --numeric-owner -I zstd -xpf /mnt/dl/rootfs.tar.zst -C /mnt/img
-          sudo install -Dm644 /mnt/dl/vmlinuz-6.13.4 /mnt/img/boot/vmlinuz-6.13.4
+          sudo tar --numeric-owner -I zstd -xpf /mnt/lfs-openrc-rootfs.tar.zst -C /mnt/img
+          sudo install -Dm644 /mnt/vmlinuz-6.13.4 /mnt/img/boot/vmlinuz-6.13.4
 
           sudo mkdir -p /mnt/img/boot/grub
           sudo tee /mnt/img/boot/grub/grub.cfg >/dev/null <<'EOT'
@@ -871,8 +725,6 @@ jobs:
         run: |
           cd /mnt
           zstd -T0 -10 -q lfs-openrc-x86_64.img -o lfs-openrc-x86_64.img.zst
-          cp /mnt/dl/rootfs.tar.zst lfs-openrc-rootfs.tar.zst
-          cp /mnt/dl/vmlinuz-6.13.4 vmlinuz-6.13.4
           sha256sum lfs-openrc-x86_64.img.zst lfs-openrc-rootfs.tar.zst vmlinuz-6.13.4 > SHA256SUMS
           ls -lh lfs-openrc-* vmlinuz-* SHA256SUMS
 
@@ -881,7 +733,6 @@ jobs:
           name: lfs-openrc-x86_64
           path: |
             /mnt/lfs-openrc-x86_64.img.zst
-            /mnt/lfs-openrc-rootfs.tar.zst
             /mnt/vmlinuz-6.13.4
             /mnt/SHA256SUMS
           retention-days: 14
