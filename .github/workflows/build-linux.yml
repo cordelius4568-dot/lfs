@@ -1,0 +1,333 @@
+name: Build Linux from scratch (glibc + BusyBox + runit + xbps)
+
+# Mimari: x86_64 | libc: glibc (kaynaktan) | userland: BusyBox
+# init: runit | paket yöneticisi: xbps (kaynaktan) | çıktı: bzImage, initramfs, ISO, xbps repo
+
+on:
+  workflow_dispatch:
+    inputs:
+      distro_name:
+        description: "Dağıtım adı"
+        default: "tinyglibc"
+      kernel_version:
+        description: "Linux kernel sürümü"
+        default: "6.12.10"
+      glibc_version:
+        description: "glibc sürümü"
+        default: "2.40"
+      busybox_version:
+        description: "BusyBox sürümü"
+        default: "1.36.1"
+      runit_version:
+        description: "runit sürümü"
+        default: "2.1.2"
+      xbps_version:
+        description: "xbps sürümü"
+        default: "0.59.2"
+      root_password:
+        description: "root parolası (test için, değiştir!)"
+        default: "root"
+      publish_release:
+        description: "GitHub Release oluştur"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  NAME: ${{ inputs.distro_name }}
+  KVER: ${{ inputs.kernel_version }}
+  GLIBC_VER: ${{ inputs.glibc_version }}
+  BB_VER: ${{ inputs.busybox_version }}
+  RUNIT_VER: ${{ inputs.runit_version }}
+  XBPS_VER: ${{ inputs.xbps_version }}
+  ROOT_PW: ${{ inputs.root_password }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
+    env:
+      WORK: ${{ github.workspace }}/work
+      ROOTFS: ${{ github.workspace }}/rootfs
+      DIST: ${{ github.workspace }}/dist
+
+    steps:
+      - name: Build bağımlılıklarını kur
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bison flex gawk texinfo python3 rsync bc cpio file \
+            libssl-dev libelf-dev libncurses-dev dwarves libarchive-dev zlib1g-dev \
+            pkg-config xz-utils bzip2 curl ca-certificates \
+            grub-pc-bin grub-common xorriso mtools qemu-system-x86
+
+      - name: Kaynak kodları indir
+        run: |
+          mkdir -p "$WORK" "$DIST"
+          cd "$WORK"
+          major="${KVER%%.*}"
+          curl -fsSLO "https://cdn.kernel.org/pub/linux/kernel/v${major}.x/linux-${KVER}.tar.xz"
+          curl -fsSLO "https://ftp.gnu.org/gnu/glibc/glibc-${GLIBC_VER}.tar.xz"
+          curl -fsSLO "https://busybox.net/downloads/busybox-${BB_VER}.tar.bz2"
+          curl -fsSLO "http://smarden.org/runit/runit-${RUNIT_VER}.tar.gz"
+          curl -fsSL -o "xbps-${XBPS_VER}.tar.gz" \
+            "https://github.com/void-linux/xbps/archive/refs/tags/${XBPS_VER}.tar.gz"
+          for f in *.tar.*; do tar xf "$f"; done
+          ls -la
+
+      - name: Rootfs iskeleti (merged-usr)
+        run: |
+          mkdir -p "$ROOTFS"/{usr/{bin,sbin,lib,share},etc,dev,proc,sys,run,tmp,var/{log,lib,cache},root,home,mnt}
+          cd "$ROOTFS"
+          ln -s usr/bin bin
+          ln -s usr/sbin sbin
+          ln -s usr/lib lib
+          ln -s usr/lib lib64
+          chmod 1777 tmp
+          chmod 700 root
+          touch etc/ld.so.conf
+
+      - name: Kernel header'larını kur
+        run: |
+          cd "$WORK/linux-${KVER}"
+          make headers_install INSTALL_HDR_PATH="$ROOTFS/usr"
+
+      - name: glibc derle
+        run: |
+          cd "$WORK"
+          mkdir build-glibc && cd build-glibc
+          echo "rootsbindir=/usr/sbin" > configparms
+          ../glibc-${GLIBC_VER}/configure \
+            --prefix=/usr \
+            --disable-werror \
+            --disable-nscd \
+            --enable-kernel=4.19 \
+            --enable-stack-protector=strong \
+            --with-headers="$ROOTFS/usr/include" \
+            libc_cv_slibdir=/usr/lib
+          make -j"$(nproc)"
+          make DESTDIR="$ROOTFS" install
+
+      - name: BusyBox derle (glibc'ye dinamik bağlı)
+        run: |
+          cd "$WORK/busybox-${BB_VER}"
+          make defconfig
+          # yeni kernel header'larıyla derlenmeyen tc applet'ini kapat
+          sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config
+          yes "" | make oldconfig
+          make -j"$(nproc)"
+          make CONFIG_PREFIX="$ROOTFS" install
+          mkdir -p "$ROOTFS/usr/share/udhcpc"
+          install -m755 examples/udhcp/simple.script "$ROOTFS/usr/share/udhcpc/default.script"
+
+      - name: runit derle (init / servis yöneticisi)
+        run: |
+          cd "$WORK/admin/runit-${RUNIT_VER}"
+          ./package/compile
+          install -m755 command/* "$ROOTFS/usr/sbin/"
+          ln -sf runit-init "$ROOTFS/usr/sbin/init"
+          ln -sf usr/sbin/runit-init "$ROOTFS/init"
+          # kapatma komutları runit-init'e yönlenir
+          printf '#!/bin/sh\nexec /usr/sbin/runit-init 0\n' > "$ROOTFS/usr/sbin/poweroff"
+          printf '#!/bin/sh\nexec /usr/sbin/runit-init 0\n' > "$ROOTFS/usr/sbin/halt"
+          printf '#!/bin/sh\nexec /usr/sbin/runit-init 6\n' > "$ROOTFS/usr/sbin/reboot"
+          chmod 755 "$ROOTFS"/usr/sbin/{poweroff,halt,reboot}
+
+      - name: xbps derle (paket yöneticisi)
+        run: |
+          cd "$WORK/xbps-${XBPS_VER}"
+          ./configure --prefix=/usr --sysconfdir=/etc
+          make -j"$(nproc)"
+          make DESTDIR="$ROOTFS" install
+          # repo oluşturmak için host'a da kur
+          sudo make install
+          sudo ldconfig
+
+      - name: Sistem yapılandırması (etc, runit, servisler)
+        run: |
+          cd "$ROOTFS"
+          HASH="$(openssl passwd -6 "$ROOT_PW")"
+
+          echo "$NAME" > etc/hostname
+          cat > etc/os-release <<EOF
+          NAME="$NAME"
+          ID=$NAME
+          PRETTY_NAME="$NAME Linux (glibc/busybox/runit/xbps)"
+          EOF
+          sed -i 's/^ *//' etc/os-release
+
+          echo "root:x:0:0:root:/root:/bin/sh" > etc/passwd
+          echo "root:${HASH}:19000:0:99999:7:::" > etc/shadow
+          chmod 600 etc/shadow
+          printf 'root:x:0:\ntty:x:5:\nwheel:x:10:root\nnogroup:x:65534:\n' > etc/group
+          printf 'passwd: files\ngroup: files\nshadow: files\nhosts: files dns\n' > etc/nsswitch.conf
+          printf 'nameserver 1.1.1.1\nnameserver 9.9.9.9\n' > etc/resolv.conf
+          printf '/bin/sh\n' > etc/shells
+          cat > etc/profile <<'EOF'
+          export PATH=/usr/sbin:/usr/bin
+          export PS1='\u@\h:\w\$ '
+          alias ll='ls -lah'
+          EOF
+          sed -i 's/^ *//' etc/profile
+
+          # xbps yapılandırması (kendi repo veya Void glibc reposu eklenebilir)
+          mkdir -p etc/xbps.d var/db/xbps
+          cat > etc/xbps.d/00-repository.conf <<'EOF'
+          # repository=https://repo-default.voidlinux.org/current
+          # repository=http://ADRES/repo
+          EOF
+          sed -i 's/^ *//' etc/xbps.d/00-repository.conf
+
+          # runit: stage 1 / 2 / 3
+          mkdir -p etc/runit etc/sv etc/service
+          cat > etc/runit/1 <<'EOF'
+          #!/bin/sh
+          export PATH=/usr/sbin:/usr/bin
+          mount -t proc proc /proc
+          mount -t sysfs sysfs /sys
+          mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev
+          mkdir -p /dev/pts /dev/shm
+          mount -t devpts devpts /dev/pts
+          mount -t tmpfs tmpfs /dev/shm
+          mount -t tmpfs tmpfs /run
+          mount -t tmpfs tmpfs /tmp
+          chmod 1777 /tmp
+          hostname -F /etc/hostname
+          ip link set lo up
+          EOF
+          cat > etc/runit/2 <<'EOF'
+          #!/bin/sh
+          export PATH=/usr/sbin:/usr/bin
+          exec runsvdir -P /etc/service 'log: ...........................................'
+          EOF
+          cat > etc/runit/3 <<'EOF'
+          #!/bin/sh
+          export PATH=/usr/sbin:/usr/bin
+          sv force-stop /etc/service/* 2>/dev/null
+          sv exit /etc/service/* 2>/dev/null
+          sync
+          umount -a -r 2>/dev/null
+          EOF
+          cat > etc/runit/ctrlaltdel <<'EOF'
+          #!/bin/sh
+          exec /usr/sbin/reboot
+          EOF
+          sed -i 's/^ *//' etc/runit/1 etc/runit/2 etc/runit/3 etc/runit/ctrlaltdel
+          chmod 755 etc/runit/{1,2,3,ctrlaltdel}
+
+          # servisler: getty (tty1 + ttyS0) ve DHCP
+          mk_service() {
+            mkdir -p "etc/sv/$1"
+            printf '#!/bin/sh\n%s\n' "$2" > "etc/sv/$1/run"
+            chmod 755 "etc/sv/$1/run"
+            ln -s "../sv/$1" "etc/service/$1"
+          }
+          mk_service getty-tty1  'exec /usr/sbin/getty 38400 tty1 linux'
+          mk_service getty-ttyS0 'exec /usr/sbin/getty -L 115200 ttyS0 vt100'
+          mk_service dhcp        'ip link set eth0 up 2>/dev/null || { sleep 30; exit 1; }
+          exec udhcpc -f -i eth0 -s /usr/share/udhcpc/default.script'
+          sed -i 's/^ *//' etc/sv/dhcp/run
+
+      - name: Çalışma zamanı kütüphanelerini topla (xbps/busybox bağımlılıkları)
+        run: |
+          find "$ROOTFS/usr/bin" "$ROOTFS/usr/sbin" -type f -perm -u+x | while read -r f; do
+            file -b "$f" | grep -q 'ELF.*dynamically' || continue
+            ldd "$f" 2>/dev/null | awk '/=> \//{print $3}'
+          done | sort -u | while read -r lib; do
+            b="$(basename "$lib")"
+            [ -e "$ROOTFS/usr/lib/$b" ] || install -Dm755 "$(readlink -f "$lib")" "$ROOTFS/usr/lib/$b"
+          done
+          sudo ldconfig -r "$ROOTFS" || true
+
+      - name: Temizlik ve strip
+        run: |
+          cd "$ROOTFS"
+          rm -rf usr/include usr/share/{man,info,doc} usr/lib/*.a usr/lib/gconv/*.so.dbg 2>/dev/null || true
+          find . -type f \( -name '*.so*' -o -perm -u+x \) | while read -r f; do
+            file -b "$f" | grep -q ELF && strip --strip-unneeded "$f" 2>/dev/null || true
+          done
+          du -sh .
+
+      - name: Kernel derle
+        run: |
+          cd "$WORK/linux-${KVER}"
+          make defconfig
+          ./scripts/config -e DEVTMPFS -e DEVTMPFS_MOUNT -e TMPFS -e BLK_DEV_INITRD \
+            -e VIRTIO -e VIRTIO_PCI -e VIRTIO_BLK -e VIRTIO_NET -e EXT4_FS \
+            -e SERIAL_8250 -e SERIAL_8250_CONSOLE -e PROC_FS -e SYSFS \
+            -d DEBUG_INFO_BTF
+          make olddefconfig
+          make -j"$(nproc)" bzImage
+          cp arch/x86/boot/bzImage "$DIST/vmlinuz-${KVER}"
+
+      - name: xbps paket reposu oluştur
+        run: |
+          sudo chown -R 0:0 "$ROOTFS"
+          mkdir -p "$DIST/repo" && cd "$DIST/repo"
+          sudo xbps-create -A x86_64 -n "${NAME}-base-1.0_1" \
+            -s "${NAME} base system" -m "builder <builder@localhost>" \
+            -l "GPL-2.0-only" "$ROOTFS"
+          sudo xbps-rindex -a ./*.xbps
+          sudo chown -R "$USER" "$DIST"
+          ls -la
+
+      - name: initramfs ve ISO oluştur
+        run: |
+          cd "$ROOTFS"
+          sudo mknod -m 622 dev/console c 5 1
+          sudo mknod -m 666 dev/null c 1 3
+          sudo mknod -m 666 dev/tty c 5 0
+          sudo sh -c "find . | cpio -o -H newc --owner 0:0 | gzip -9 > '$DIST/initramfs-${KVER}.cpio.gz'"
+
+          mkdir -p "$WORK/iso/boot/grub"
+          cp "$DIST/vmlinuz-${KVER}" "$WORK/iso/boot/vmlinuz"
+          cp "$DIST/initramfs-${KVER}.cpio.gz" "$WORK/iso/boot/initramfs.gz"
+          cat > "$WORK/iso/boot/grub/grub.cfg" <<EOF
+          serial --unit=0 --speed=115200
+          terminal_input serial console
+          terminal_output serial console
+          set timeout=3
+          menuentry "${NAME}" {
+            linux /boot/vmlinuz rdinit=/init console=tty0 console=ttyS0,115200
+            initrd /boot/initramfs.gz
+          }
+          EOF
+          sed -i 's/^ *//' "$WORK/iso/boot/grub/grub.cfg"
+          grub-mkrescue -o "$DIST/${NAME}.iso" "$WORK/iso"
+          ls -lah "$DIST"
+
+      - name: QEMU smoke test (login prompt gelmeli)
+        run: |
+          timeout 150 qemu-system-x86_64 -m 512 -cpu max -accel tcg \
+            -kernel "$DIST/vmlinuz-${KVER}" \
+            -initrd "$DIST/initramfs-${KVER}.cpio.gz" \
+            -append "console=ttyS0 rdinit=/init panic=-1" \
+            -display none -serial stdio -monitor none -no-reboot \
+            > "$WORK/boot.log" 2>&1 || true
+          tail -n 40 "$WORK/boot.log"
+          grep -q "login:" "$WORK/boot.log"
+
+      - name: Artifact yükle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.distro_name }}-${{ inputs.kernel_version }}
+          path: |
+            dist/
+            work/boot.log
+
+      - name: GitHub Release
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.distro_name }}-${{ github.run_number }}
+          name: ${{ inputs.distro_name }} (kernel ${{ inputs.kernel_version }}, glibc ${{ inputs.glibc_version }})
+          files: |
+            dist/*.iso
+            dist/vmlinuz-*
+            dist/initramfs-*.cpio.gz
