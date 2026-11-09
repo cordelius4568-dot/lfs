@@ -61,7 +61,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential bison flex gawk texinfo python3 rsync bc cpio file \
+            build-essential bison flex gawk gettext texinfo python3 rsync bc cpio file \
             libssl-dev libelf-dev libncurses-dev dwarves libarchive-dev zlib1g-dev \
             pkg-config xz-utils bzip2 curl ca-certificates \
             grub-pc-bin grub-common xorriso mtools qemu-system-x86
@@ -102,6 +102,9 @@ jobs:
           cd "$WORK"
           mkdir build-glibc && cd build-glibc
           echo "rootsbindir=/usr/sbin" > configparms
+          # Ubuntu gcc varsayılan olarak -D_FORTIFY_SOURCE=3 ekler; glibc bununla derlenmez
+          export CC="gcc -U_FORTIFY_SOURCE"
+          export CFLAGS="-O2 -g"
           ../glibc-${GLIBC_VER}/configure \
             --prefix=/usr \
             --disable-werror \
@@ -112,6 +115,7 @@ jobs:
             libc_cv_slibdir=/usr/lib
           make -j"$(nproc)"
           make DESTDIR="$ROOTFS" install
+          unset CC CFLAGS
 
       - name: BusyBox derle (glibc'ye dinamik bağlı)
         run: |
