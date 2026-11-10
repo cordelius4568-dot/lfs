@@ -1,6 +1,6 @@
 name: Build Linux from scratch (glibc + BusyBox + runit + xbps)
 
-# Mimari: x86_64 | libc: glibc (kaynaktan) | userland: BusyBox
+# Mimari: x86_64 | libc: glibc (hazır Ubuntu 24.04 paketinden çekilir, derlenmez) | userland: BusyBox
 # init: runit | paket yöneticisi: xbps (kaynaktan) | çıktı: bzImage, initramfs, ISO, xbps repo
 
 on:
@@ -12,9 +12,6 @@ on:
       kernel_version:
         description: "Linux kernel sürümü"
         default: "6.12.10"
-      glibc_version:
-        description: "glibc sürümü"
-        default: "2.40"
       busybox_version:
         description: "BusyBox sürümü"
         default: "1.36.1"
@@ -38,7 +35,6 @@ permissions:
 env:
   NAME: ${{ inputs.distro_name }}
   KVER: ${{ inputs.kernel_version }}
-  GLIBC_VER: ${{ inputs.glibc_version }}
   BB_VER: ${{ inputs.busybox_version }}
   RUNIT_VER: ${{ inputs.runit_version }}
   XBPS_VER: ${{ inputs.xbps_version }}
@@ -72,7 +68,6 @@ jobs:
           cd "$WORK"
           major="${KVER%%.*}"
           curl -fsSLO "https://cdn.kernel.org/pub/linux/kernel/v${major}.x/linux-${KVER}.tar.xz"
-          curl -fsSLO "https://ftp.gnu.org/gnu/glibc/glibc-${GLIBC_VER}.tar.xz"
           curl -fsSLO "https://busybox.net/downloads/busybox-${BB_VER}.tar.bz2"
           curl -fsSLO "http://smarden.org/runit/runit-${RUNIT_VER}.tar.gz"
           curl -fsSL -o "xbps-${XBPS_VER}.tar.gz" \
@@ -92,30 +87,19 @@ jobs:
           chmod 700 root
           touch etc/ld.so.conf
 
-      - name: Kernel header'larını kur
+      - name: glibc'yi hazır paketten çek (derleme yok)
         run: |
-          cd "$WORK/linux-${KVER}"
-          make headers_install INSTALL_HDR_PATH="$ROOTFS/usr"
-
-      - name: glibc derle
-        run: |
-          cd "$WORK"
-          mkdir build-glibc && cd build-glibc
-          echo "rootsbindir=/usr/sbin" > configparms
-          # Ubuntu gcc varsayılan olarak -D_FORTIFY_SOURCE=3 ekler; glibc bununla derlenmez
-          export CC="gcc -U_FORTIFY_SOURCE"
-          export CFLAGS="-O2 -g"
-          ../glibc-${GLIBC_VER}/configure \
-            --prefix=/usr \
-            --disable-werror \
-            --disable-nscd \
-            --enable-kernel=4.19 \
-            --enable-stack-protector=strong \
-            --with-headers="$ROOTFS/usr/include" \
-            libc_cv_slibdir=/usr/lib
-          make -j"$(nproc)"
-          make DESTDIR="$ROOTFS" install
-          unset CC CFLAGS
+          mkdir -p "$WORK/debs" "$WORK/glibc-x" && cd "$WORK/debs"
+          # Runner ile aynı sürüm (Ubuntu 24.04, glibc 2.39): host'ta derlenen ikililerle birebir uyumlu
+          apt-get download libc6 libcrypt1 libgcc-s1
+          for d in *.deb; do dpkg-deb -x "$d" "$WORK/glibc-x"; done
+          cd "$WORK/glibc-x"
+          [ -d usr ] && cp -a usr/. "$ROOTFS/usr/"
+          [ -d lib ] && cp -a lib/. "$ROOTFS/usr/lib/" || true
+          # dinamik yükleyici yolu: /lib64/ld-linux-x86-64.so.2
+          ln -sf x86_64-linux-gnu/ld-linux-x86-64.so.2 "$ROOTFS/usr/lib/ld-linux-x86-64.so.2"
+          printf '/usr/lib/x86_64-linux-gnu\n/usr/lib\n' > "$ROOTFS/etc/ld.so.conf"
+          ls "$ROOTFS/usr/lib/x86_64-linux-gnu" | head -30
 
       - name: BusyBox derle (glibc'ye dinamik bağlı)
         run: |
@@ -244,7 +228,8 @@ jobs:
             ldd "$f" 2>/dev/null | awk '/=> \//{print $3}'
           done | sort -u | while read -r lib; do
             b="$(basename "$lib")"
-            [ -e "$ROOTFS/usr/lib/$b" ] || install -Dm755 "$(readlink -f "$lib")" "$ROOTFS/usr/lib/$b"
+            [ -e "$ROOTFS/usr/lib/$b" ] || [ -e "$ROOTFS/usr/lib/x86_64-linux-gnu/$b" ] || \
+              install -Dm755 "$(readlink -f "$lib")" "$ROOTFS/usr/lib/x86_64-linux-gnu/$b"
           done
           sudo ldconfig -r "$ROOTFS" || true
 
@@ -330,7 +315,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.distro_name }}-${{ github.run_number }}
-          name: ${{ inputs.distro_name }} (kernel ${{ inputs.kernel_version }}, glibc ${{ inputs.glibc_version }})
+          name: ${{ inputs.distro_name }} (kernel ${{ inputs.kernel_version }})
           files: |
             dist/*.iso
             dist/vmlinuz-*
