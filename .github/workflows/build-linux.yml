@@ -130,6 +130,8 @@ jobs:
         run: |
           cd "$WORK/xbps-${XBPS_VER}"
           ./configure --prefix=/usr --sysconfdir=/etc
+          # OpenSSL 3 deprecation uyarıları -Werror yüzünden hataya dönüyor; -Werror'u kaldır
+          find . \( -name 'config.mk' -o -name 'Makefile' -o -name '*.mk' \) -exec sed -i 's/-Werror//g' {} +
           make -j"$(nproc)"
           make DESTDIR="$ROOTFS" install
           # repo oluşturmak için host'a da kur
