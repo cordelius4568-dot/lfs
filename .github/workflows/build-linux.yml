@@ -121,6 +121,8 @@ jobs:
           ln -sf runit-init "$ROOTFS/usr/sbin/init"
           ln -sf usr/sbin/runit-init "$ROOTFS/init"
           # kapatma komutları runit-init'e yönlenir
+          # DİKKAT: bunlar BusyBox'a symlink; önce sil, yoksa busybox binary'sinin üzerine yazılır
+          rm -f "$ROOTFS"/usr/sbin/{poweroff,halt,reboot}
           printf '#!/bin/sh\nexec /usr/sbin/runit-init 0\n' > "$ROOTFS/usr/sbin/poweroff"
           printf '#!/bin/sh\nexec /usr/sbin/runit-init 0\n' > "$ROOTFS/usr/sbin/halt"
           printf '#!/bin/sh\nexec /usr/sbin/runit-init 6\n' > "$ROOTFS/usr/sbin/reboot"
@@ -236,7 +238,6 @@ jobs:
           sudo ldconfig -r "$ROOTFS" || true
           # ldconfig root olarak dosya oluşturdu (var/cache/ldconfig); sahipliği geri ver
           sudo chown -R "$(id -u):$(id -g)" "$ROOTFS"
-
 
       - name: Kernel derle
         run: |
