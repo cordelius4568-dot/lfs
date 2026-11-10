@@ -234,15 +234,9 @@ jobs:
               install -Dm755 "$(readlink -f "$lib")" "$ROOTFS/usr/lib/x86_64-linux-gnu/$b"
           done
           sudo ldconfig -r "$ROOTFS" || true
+          # ldconfig root olarak dosya oluşturdu (var/cache/ldconfig); sahipliği geri ver
+          sudo chown -R "$(id -u):$(id -g)" "$ROOTFS"
 
-      - name: Temizlik ve strip
-        run: |
-          cd "$ROOTFS"
-          rm -rf usr/include usr/share/{man,info,doc} usr/lib/*.a usr/lib/gconv/*.so.dbg 2>/dev/null || true
-          find . -type f \( -name '*.so*' -o -perm -u+x \) | while read -r f; do
-            file -b "$f" | grep -q ELF && strip --strip-unneeded "$f" 2>/dev/null || true
-          done
-          du -sh .
 
       - name: Kernel derle
         run: |
