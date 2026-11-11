@@ -97,9 +97,13 @@ jobs:
           [ -d usr ] && cp -a usr/. "$ROOTFS/usr/"
           [ -d lib ] && cp -a lib/. "$ROOTFS/usr/lib/" || true
           # dinamik yükleyici yolu: /lib64/ld-linux-x86-64.so.2
-          ln -sf x86_64-linux-gnu/ld-linux-x86-64.so.2 "$ROOTFS/usr/lib/ld-linux-x86-64.so.2"
-          printf '/usr/lib/x86_64-linux-gnu\n/usr/lib\n' > "$ROOTFS/etc/ld.so.conf"
-          ls "$ROOTFS/usr/lib/x86_64-linux-gnu" | head -30
+          # Void düzenine uyum: multiarch dizinini /usr/lib'e düzleştir (Void'in glibc paketi temiz üzerine yazabilsin)
+          cd "$ROOTFS/usr/lib"
+          cp -a x86_64-linux-gnu/. .
+          rm -rf x86_64-linux-gnu
+          ln -s . x86_64-linux-gnu
+          printf '/usr/lib\n' > "$ROOTFS/etc/ld.so.conf"
+          ls "$ROOTFS/usr/lib" | head -30
 
       - name: BusyBox derle (glibc'ye dinamik bağlı)
         run: |
@@ -162,6 +166,8 @@ jobs:
           printf '/bin/sh\n' > etc/shells
           cat > etc/profile <<'EOF'
           export PATH=/usr/sbin:/usr/bin
+          export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+          export SSL_CA_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
           export PS1='\u@\h:\w\$ '
           alias ll='ls -lah'
           EOF
@@ -170,9 +176,15 @@ jobs:
           # xbps yapılandırması (kendi repo veya Void glibc reposu eklenebilir)
           mkdir -p etc/xbps.d var/db/xbps
           cat > etc/xbps.d/00-repository.conf <<'EOF'
-          # repository=https://repo-default.voidlinux.org/current
-          # repository=http://ADRES/repo
+          repository=https://repo-default.voidlinux.org/current
           EOF
+
+          # HTTPS için CA sertifikaları (runner'dan)
+          mkdir -p etc/ssl/certs usr/lib/ssl
+          cp -L /etc/ssl/certs/ca-certificates.crt etc/ssl/certs/ca-certificates.crt
+          cp etc/ssl/certs/ca-certificates.crt etc/ssl/cert.pem
+          ln -sfn /etc/ssl/certs usr/lib/ssl/certs
+          ln -sfn /etc/ssl/cert.pem usr/lib/ssl/cert.pem
           sed -i 's/^ *//' etc/xbps.d/00-repository.conf
 
           # runit: stage 1 / 2 / 3
@@ -232,8 +244,8 @@ jobs:
             ldd "$f" 2>/dev/null | awk '/=> \//{print $3}'
           done | sort -u | while read -r lib; do
             b="$(basename "$lib")"
-            [ -e "$ROOTFS/usr/lib/$b" ] || [ -e "$ROOTFS/usr/lib/x86_64-linux-gnu/$b" ] || \
-              install -Dm755 "$(readlink -f "$lib")" "$ROOTFS/usr/lib/x86_64-linux-gnu/$b"
+            [ -e "$ROOTFS/usr/lib/$b" ] || \
+              install -Dm755 "$(readlink -f "$lib")" "$ROOTFS/usr/lib/$b"
           done
           sudo ldconfig -r "$ROOTFS" || true
           # ldconfig root olarak dosya oluşturdu (var/cache/ldconfig); sahipliği geri ver
