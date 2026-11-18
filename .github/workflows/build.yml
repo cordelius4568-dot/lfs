@@ -97,6 +97,16 @@ jobs:
           # Kontrol: kritik ayarlar tutmus mu?
           grep -E "BR2_INIT_SYSTEMD|BR2_PACKAGE_RPM|BR2_PACKAGE_GIT=" .config
 
+          # rpm sessizce dusmusse sebebini yazdir ve derlemeyi durdur
+          if ! grep -q "^BR2_PACKAGE_RPM=y" .config; then
+            echo "::error::BR2_PACKAGE_RPM olddefconfig tarafindan silindi (bagimlilik saglanmiyor)"
+            echo "----- package/rpm/Config.in -----"
+            cat package/rpm/Config.in
+            echo "----- toolchain ayarlari -----"
+            grep -E "BR2_STATIC_LIBS|BR2_SHARED_LIBS|BR2_USE_WCHAR|BR2_TOOLCHAIN_HAS_THREADS|BR2_TOOLCHAIN_USES_GLIBC|BR2_ENABLE_LOCALE|BR2_PACKAGE_RPM" .config
+            exit 1
+          fi
+
       - name: Build MikoOS
         working-directory: ./buildroot
         run: make -j$(nproc)
