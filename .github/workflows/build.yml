@@ -1,0 +1,108 @@
+name: Build MikoOS (systemd + rpm + git)
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses-dev rsync bc \
+            cpio unzip wget libelf-dev libssl-dev qemu-system-x86 qemu-utils
+
+      - name: Clone Buildroot
+        run: |
+          git clone --depth 1 https://github.com/buildroot/buildroot
+
+      - name: Create post-build script
+        run: |
+          mkdir -p buildroot/board/mikoos
+          cat > buildroot/board/mikoos/post-build.sh << 'EOF'
+          #!/bin/sh
+          TARGET_DIR="$1"
+
+          # MikoOS kimlik bilgileri
+          cat > "$TARGET_DIR/etc/os-release" << 'OSR'
+          NAME=MikoOS
+          VERSION=-ga818f62f
+          ID=MikoBox
+          VERSION_ID=2026.05-git
+          PRETTY_NAME="MikoOS 2026.05-git"
+          OSR
+          echo "Welcome to MikoOS 2026.05-git" > "$TARGET_DIR/etc/issue"
+          echo "MikoOS 2026.05-git" > "$TARGET_DIR/etc/motd"
+
+          # rpm veritabani dizini
+          mkdir -p "$TARGET_DIR/var/lib/rpm"
+          EOF
+          chmod +x buildroot/board/mikoos/post-build.sh
+
+      - name: Configure Buildroot
+        working-directory: ./buildroot
+        run: |
+          make qemu_x86_64_defconfig
+
+          # Ayari once siler, sonra ekler (cift satir olmasin)
+          set_opt() {
+            sed -i "/^$1=/d; /^# $1 is not set/d" .config
+            echo "$1=$2" >> .config
+          }
+
+          # glibc + systemd
+          sed -i '/BR2_TOOLCHAIN_BUILDROOT_MUSL/d' .config
+          sed -i '/BR2_INIT_BUSYBOX/d' .config
+          sed -i '/BR2_INIT_SYSV/d' .config
+          sed -i '/BR2_INIT_OPENRC/d' .config
+          set_opt BR2_TOOLCHAIN_BUILDROOT_GLIBC y
+          set_opt BR2_INIT_SYSTEMD y
+
+          # Marka ayarlari
+          set_opt BR2_TARGET_GENERIC_HOSTNAME '"mikoos"'
+          set_opt BR2_TARGET_GENERIC_ISSUE '"Welcome to MikoOS"'
+          set_opt BR2_ROOTFS_POST_BUILD_SCRIPT '"board/mikoos/post-build.sh"'
+
+          # Git ve bagimliliklari
+          set_opt BR2_PACKAGE_GIT y
+          set_opt BR2_PACKAGE_OPENSSL y
+          set_opt BR2_PACKAGE_ZLIB y
+          set_opt BR2_PACKAGE_LIBCURL y
+          set_opt BR2_PACKAGE_EXPAT y
+
+          # Ag ve temel araclar
+          set_opt BR2_PACKAGE_IPROUTE2 y
+          set_opt BR2_PACKAGE_DHCPCD y
+          set_opt BR2_PACKAGE_CA_CERTIFICATES y
+          set_opt BR2_PACKAGE_WGET y
+
+          # Paket yoneticisi (rpm)
+          set_opt BR2_PACKAGE_RPM y
+
+          # Disk boyutu (1GB)
+          set_opt BR2_TARGET_ROOTFS_EXT2 y
+          set_opt BR2_TARGET_ROOTFS_EXT2_4 y
+          set_opt BR2_TARGET_ROOTFS_EXT2_SIZE '"1G"'
+
+          make olddefconfig
+
+          # Kontrol: kritik ayarlar tutmus mu?
+          grep -E "BR2_INIT_SYSTEMD|BR2_PACKAGE_RPM|BR2_PACKAGE_GIT=" .config
+
+      - name: Build MikoOS
+        working-directory: ./buildroot
+        run: make -j$(nproc)
+
+      - name: Upload Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: mikoos-image
+          path: buildroot/output/images/
