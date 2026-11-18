@@ -85,6 +85,10 @@ jobs:
           set_opt BR2_PACKAGE_WGET y
 
           # Paket yoneticisi (rpm)
+          # rpm'in Config.in bagimliliklari: Lua (5.1 haric) + BusyBox "show others"
+          set_opt BR2_PACKAGE_BUSYBOX_SHOW_OTHERS y
+          set_opt BR2_PACKAGE_LUA y
+          set_opt BR2_PACKAGE_LUA_5_4 y
           set_opt BR2_PACKAGE_RPM y
 
           # Disk boyutu (1GB)
